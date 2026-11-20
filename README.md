@@ -11,7 +11,7 @@ a separate repo (`WheelUI`) and talks to this project through `src/lib/supabase.
 | Table | Holds |
 |---|---|
 | `profiles` | One row per member: `full_name`, `language` (chosen at sign-up, editable in Profile), `membership_id` (`WW100001`, …), `deleted_at` (set when the member deletes their account; soft delete), and the chat privacy settings `show_in_member_list` (off = left out of the Members list) and `allow_messages` (off = nobody can start a new chat with them; chats that already have messages carry on), both on by default. Created automatically on sign-up by the `on_auth_user_created` trigger. Members can update only `full_name`, `language`, `show_in_member_list` and `allow_messages`. |
-| `user_settings` | One row per member, one column per setting: `wheel_type` (`european` / `americanDoubleZero` / `tripleZero`), `display_style` (`standard` / `highContrast`), `last_number` (last selected pocket: `0`–`36`, `00`, `000`, or null), `updated_at`. The database rejects invalid values. Gives a member the same settings on every device. |
+| `user_settings` | One row per member, one column per setting: `wheel_type` (`european` / `americanDoubleZero` / `tripleZero`), `display_style` (`standard` / `highContrast`), `last_number` (last selected pocket: `0`–`36`, `00`, `000`, or null), `show_clock_face` (clock face around the wheel on/off, default on), `updated_at`. The database rejects invalid values. Gives a member the same settings on every device. |
 
 Row-level security is on for both tables: each member can only read and write their own row.
 
@@ -88,6 +88,7 @@ All schema changes live in `supabase/migrations/` and are applied in filename or
 | `20261119104944_reactivate_account.sql` | applied (19 Nov 2026), adds `reactivate_account()`: signing up again with a deleted account's email and original password reactivates it |
 | `20261119111618_chat_privacy_settings.sql` | applied (19 Nov 2026), adds `profiles.show_in_member_list` / `allow_messages`; `list_members()` hides opted-out members; new chats refused when messages are off. Accidentally dropped the deleted-member filter from `list_members()` |
 | `20261119111735_list_members_hide_deleted.sql` | applied (19 Nov 2026), restores the deleted-member filter in `list_members()` |
+| `20261120053140_user_settings_show_clock_face.sql` | applied (20 Nov 2026), adds `user_settings.show_clock_face` (Settings → clock face on/off) |
 
 File version numbers match the project's migration history, so `supabase migration list`
 shows local and remote in step.

@@ -10,25 +10,29 @@ a separate repo (`WheelUI`) and talks to this project through `src/lib/supabase.
 
 | Table | Holds |
 |---|---|
-| `profiles` | One row per member: `full_name`, `language` (chosen at sign-up, editable in Profile), `membership_id` (`WW100001`, …), `deleted_at` (set when the member deletes their account; soft delete), and the chat privacy settings `show_in_member_list` (off = left out of the Members list) and `allow_messages` (off = nobody can start a new chat with them; chats that already have messages carry on), both on by default. Created automatically on sign-up by the `on_auth_user_created` trigger. Members can update only `full_name`, `language`, `show_in_member_list` and `allow_messages`. |
+| `profiles` | One row per member: `full_name`, `language` (chosen at sign-up, editable in Profile), `membership_id` (`WW100001`, …), `deleted_at` (set when the member deletes their account; soft delete), `deleted_email` (the deleted member's original email, kept for the team; the auth user's email is swapped for a placeholder so the email is free again), and the chat privacy settings `show_in_member_list` (off = left out of the Members list) and `allow_messages` (off = no messaging at all, both ways and in every chat: nobody can message them and they can't send messages; old messages stay visible), both on by default. Created automatically on sign-up by the `on_auth_user_created` trigger. Members can update only `full_name`, `language`, `show_in_member_list` and `allow_messages`. |
 | `user_settings` | One row per member, one column per setting: `wheel_type` (`european` / `americanDoubleZero` / `tripleZero`), `display_style` (`standard` / `highContrast`), `last_number` (last selected pocket: `0`–`36`, `00`, `000`, or null), `show_clock_face` (clock face around the wheel on/off, default on), `updated_at`. The database rejects invalid values. Gives a member the same settings on every device. |
+| `teaching_progress` | One row per member: where they are in the Brain De Fogger™ lessons. `status` (`new` / `started` / `skipped` / `completed`; the app opens the lessons by itself after sign-in until they are completed or skipped), `lesson` and `step` (last step the member was on, 0-based), `done_lessons` (finished lessons, 0-based), `saved_at` (set by the app; the newer of the device copy and this row wins). Members can read, insert and update only their own row. |
 
-Row-level security is on for both tables: each member can only read and write their own row.
+Row-level security is on for these tables: each member can only read and write their own row.
 
 ### Member chat (B20)
 
 | Table | Holds |
 |---|---|
 | `conversations` | One row per chat. `kind` is `direct` (1:1) or `group` (reserved). `direct_key` (the two member ids, sorted) makes each pair share one chat. `last_message_at` orders the inbox (kept up to date by the `messages_touch_conversation` trigger). |
-| `conversation_members` | Who is in each chat, plus `last_read_at` (that member's read marker, used for unread counts). Members cannot write this table directly. |
-| `messages` | `kind` is `text`, `image` or `video`. `body` is the text, or an optional caption for media (max 1000 chars; text messages cannot be empty). `edited_at` / `deleted_at` are reserved for editing and moderation. Published to **Realtime** so new messages are pushed live. |
+| `conversation_members` | Who is in each chat, plus `last_read_at` (that member's read marker, used for unread counts and read receipts: the other member sees "Seen" on messages sent before it). `cleared_at` ("Clear chat": messages up to then are hidden from that member only) and `removed_at` ("Remove": the chat also leaves that member's inbox until a new message arrives). Published to **Realtime** so read receipts update live. Members cannot write this table directly. |
+| `messages` | `kind` is `text`, `image` or `video`. `body` is the text, or an optional caption for media (max 1000 chars; text messages cannot be empty). `deleted_at` is set when the sender deletes the message (`delete_message`). It is a soft delete: the text, attachments and files are kept so the message can be retrieved, and the team can restore it by clearing `deleted_at`. Every member-facing query skips deleted messages. `edited_at` is set when the sender edits the text or caption (`edit_message`); the app shows "Edited". Published to **Realtime** so new messages, and edits and deletions (as updates), are pushed live. |
 | `blocked_members` | Who each member has blocked (`blocker_id`, `blocked_id`, `created_at`). A member adds and removes only their own rows (block / unblock) and sees only their own blocks, never who blocked them. While a block exists, in either direction, neither member can send messages or upload files in their chat. Earlier messages stay visible. |
 | `message_attachments` | Files for image/video messages (several per message allowed): `storage_path`, `mime_type`, `size_bytes`, `width`, `height`, `duration_ms`, `thumbnail_path` (not used yet). |
 
 Storage: private bucket **`chat-media`** (50 MB per file; images: jpeg, png, heic, heif, webp, gif;
 videos: mp4, quicktime, 3gpp, webm). Files live at `<conversation_id>/<sender_id>/<file>`.
 Only members of that conversation can read them, and a member can upload only into their own
-folder. The app shows files through short-lived signed URLs.
+folder. Members cannot delete files. The app shows files through short-lived signed URLs.
+
+Typing indicator: Realtime broadcast on the private channel `typing:<conversation_id>`; nothing is saved.
+Policies on `realtime.messages` let only members of that conversation join, send or receive.
 
 Who can see what: only members of a conversation can read its messages, attachments and files.
 Messages can only be sent as yourself, and not while either member has blocked the other.
@@ -48,22 +52,27 @@ process are placeholders until the client agrees them.
 
 ### Functions the app calls (RPC)
 
-All require a signed-in member and act only on that member's own data, except `reactivate_account`, which is called signed out.
+All require a signed-in member and act only on that member's own data.
 
 | Function | Does |
 |---|---|
-| `list_members()` | The member directory: every other member's `id`, `full_name`, `membership_id` and `allow_messages`. Leaves out deleted members and members with `show_in_member_list` off. |
-| `get_or_create_direct_conversation(other_id)` | Returns the 1:1 chat with that member, creating it (with both members) on first use. Refuses with `messages_off` if that member has `allow_messages` off and the pair has no messages yet. |
-| `list_conversations()` | The inbox, latest first: the other member, the last message, and `unread_count`. |
+| `list_members()` | The member directory: every other member's `id`, `full_name`, `membership_id`, and `allow_messages`. Leaves out deleted members and members with `show_in_member_list` off. |
+| `get_or_create_direct_conversation(other_id)` | Returns the 1:1 chat with that member, creating it (with both members) on first use. Refuses with `messages_off` if either member has `allow_messages` off. |
+| `list_conversations()` | The inbox, latest first: the other member (with their `allow_messages`), the last message, and `unread_count`, all counted after the member's `cleared_at`. A cleared chat with nothing new still shows (last message columns null); a removed chat shows again once a new message arrives. |
 | `send_media_message(conv, kind, caption, storage_path, mime_type, size_bytes, width, height, duration_ms)` | Saves an image/video message and its attachment together, after the file is uploaded. Refuses if the file is missing or the path/type is wrong. |
 | `mark_conversation_read(conv)` | Moves the member's read marker to now (never backwards). |
-| `delete_my_account()` | Soft-deletes the member: sets `profiles.deleted_at`, bans their auth user so they can't sign in again, and ends their sessions. All their data stays (earlier chat messages remain visible to the other member). Deleted members are left out of `list_members()`. Signing up again with the same email and the original password reactivates it (`reactivate_account`); the team can also restore it by clearing `profiles.deleted_at` and `auth.users.banned_until`. |
-| `reactivate_account(email, password)` | Callable signed out. The app calls it before sign-up: if the email belongs to a deleted account and the password matches, it clears `deleted_at` and the ban, and the app signs the member in with all their old data. Returns false otherwise, without saying why. |
+| `clear_conversation(conv)` | "Clear chat" for the member only: sets `cleared_at` and the read marker to now (and clears `removed_at`). The history is hidden from them by the messages read policy; the chat stays in their inbox. Nothing is deleted. |
+| `remove_conversation(conv)` | "Remove" (delete the chat for me): like `clear_conversation` and also sets `removed_at`, so the chat leaves the inbox until a new message arrives. Nothing is deleted. |
+| `delete_message(msg)` | Deletes one of the member's own messages for both people by setting `deleted_at` (soft delete: text, attachments and files are kept and can be retrieved; restore by clearing `deleted_at`). Refuses another member's message; does nothing if already deleted. |
+| `edit_message(msg, new_body)` | Edits the text (or image/video caption) of one of the member's own messages and sets `edited_at`. No time limit. Text is trimmed; a text message can't be emptied (an empty caption becomes null); max 1000 characters. Refuses another member's message, a deleted message, or while either member has blocked the other or has `allow_messages` off. Unchanged text does nothing. |
+| `delete_my_account()` | Soft-deletes the member and frees their email: sets `profiles.deleted_at`, saves the email in `profiles.deleted_email`, swaps the auth email for a placeholder (`deleted+<user id>@deleted.invalid`), bans their auth user so they can't sign in again, and ends their sessions. All their data stays (earlier chat messages remain visible to the other member). Deleted members are left out of `list_members()`. Signing up again with the same email creates a brand-new account; old data does not carry over. The team can restore the old account by clearing `profiles.deleted_at` and `auth.users.banned_until` and copying `deleted_email` back, only if no new account has taken that email. |
 
 Block and unblock are plain insert/delete on `blocked_members` (no RPC).
 
 Internal helpers used by the security rules: `is_conversation_member(conv)`,
-`is_chat_folder_member(folder)`, `is_blocked_in_conversation(conv)`.
+`is_chat_folder_member(folder)`, `is_blocked_in_conversation(conv)`,
+`is_messaging_off_in_conversation(conv)` (either member has `allow_messages` off: no sends, uploads or edits),
+`conversation_cleared_at(conv)` (members read only messages after their own `cleared_at`).
 
 Not created yet, because the client hasn't agreed the rules: QR/booklet links, ordering,
 push notifications.
@@ -89,6 +98,15 @@ All schema changes live in `supabase/migrations/` and are applied in filename or
 | `20261119111618_chat_privacy_settings.sql` | applied (19 Nov 2026), adds `profiles.show_in_member_list` / `allow_messages`; `list_members()` hides opted-out members; new chats refused when messages are off. Accidentally dropped the deleted-member filter from `list_members()` |
 | `20261119111735_list_members_hide_deleted.sql` | applied (19 Nov 2026), restores the deleted-member filter in `list_members()` |
 | `20261120053140_user_settings_show_clock_face.sql` | applied (20 Nov 2026), adds `user_settings.show_clock_face` (Settings → clock face on/off) |
+| `20261120085547_chat_delete_message.sql` | applied (20 Nov 2026), first version of `delete_message()`: cleared the text and removed attachments/files; replaced by the next migration |
+| `20261120090217_chat_keep_deleted_messages.sql` | applied (20 Nov 2026), message deletion becomes a soft delete: `delete_message()` only sets `deleted_at` and keeps everything; removes the chat-media delete policy and restores the non-empty text check |
+| `20261120090533_chat_read_receipts_typing.sql` | applied (20 Nov 2026), publishes `conversation_members` to Realtime (live read receipts) and adds `realtime.messages` policies for the private `typing:<conversation_id>` broadcast channel |
+| `20261123052331_deleted_account_frees_email.sql` | applied (23 Nov 2026), deleting an account frees its email (saved in new `profiles.deleted_email`, placeholder on the auth user) so the same email can sign up as a new account; frees the emails of already-deleted accounts; drops `reactivate_account()` (signed-out password check) |
+| `20261123063940_teaching_progress.sql` | applied (23 Nov 2026), new `teaching_progress` table for the Brain De Fogger™ lessons (status, current lesson and step, finished lessons) with row-level security |
+| `20261124082522_chat_edit_message.sql` | applied (24 Nov 2026), adds `edit_message()`: members edit the text/caption of their own messages (no time limit), setting `edited_at` |
+| `20261124085835_chat_clear_and_remove.sql` | applied (24 Nov 2026), adds `conversation_members.cleared_at` / `removed_at`, `clear_conversation()` and `remove_conversation()` (both for the member only, nothing deleted); the messages read policy hides messages before the member's `cleared_at`; `list_conversations()` respects both |
+| `20261124091900_list_members_has_chat.sql` | applied (24 Nov 2026), `list_members()` also returns `has_chat`, so the app shows "not accepting messages" only when a message would really be refused (including chats removed from the inbox) |
+| `20261124092622_chat_messages_off_both_ways.sql` | applied (24 Nov 2026), `allow_messages` off now stops all messaging both ways in every chat (sends, uploads, edits, opening a chat), like a block; `list_conversations()` returns `member_allow_messages`; removes `has_chat` from `list_members()` again |
 
 File version numbers match the project's migration history, so `supabase migration list`
 shows local and remote in step.
@@ -120,7 +138,7 @@ and change a function by adding a new migration (then update its file here). `pu
 and the `ensure_rls` event trigger come from Supabase's project setup, not from our migrations.
 
 Refresh check: each file's definition matches `pg_get_functiondef()` / `pg_get_triggerdef()`
-on the live database (last checked 19 Nov 2026).
+on the live database (last checked 19 Nov 2026; `delete_my_account` re-checked 23 Nov 2026).
 
 ## Claude Code
 

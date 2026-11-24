@@ -41,7 +41,7 @@ create table public.message_attachments (
   id uuid primary key default gen_random_uuid(),
   message_id uuid not null references public.messages(id) on delete cascade,
   kind text not null check (kind in ('image', 'video')),
-  storage_path text not null,       -- e.g. <conversation_id>/<message_id>/<file>
+  storage_path text not null,       -- e.g. <conversation_id>/<sender_id>/<file>
   mime_type text not null,
   size_bytes bigint check (size_bytes >= 0),
   width int,

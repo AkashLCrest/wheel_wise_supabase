@@ -3,13 +3,12 @@
 -- RPC: returns the 1:1 conversation with another member, creating it (and adding
 -- both members) on first use. direct_key (sorted member ids) keeps one chat
 -- per pair, even if both members start a chat at the same moment.
--- Refuses with 'messages_off' when the other member has allow_messages off and
--- the pair has no messages yet (they can't be sent a first message; a chat
--- that already has messages carries on).
+-- Refuses with 'messages_off' when either member has allow_messages off, even
+-- if they have talked before (off stops all messaging, both ways).
 -- security definer: members cannot insert conversations/members directly.
--- App: ChatContext openDirectConversation() (on first send).
+-- App: ChatContext openDirectConversation() (on every send).
 --
--- Created in migration: 20261119040231_member_chat (allow_messages check added in 20261119111618_chat_privacy_settings)
+-- Created in migration: 20261119040231_member_chat (allow_messages check added in 20261119111618_chat_privacy_settings; both ways, chats with messages included, in 20261124092622_chat_messages_off_both_ways)
 -- Reference copy of the live definition (pg_get_functiondef). Do not apply
 -- this file; change functions with a new migration.
 
@@ -32,12 +31,10 @@ begin
   end if;
   key := least(me::text, other_id::text) || ':' || greatest(me::text, other_id::text);
 
-  if not (select allow_messages from public.profiles where id = other_id)
-     and not exists (
-       select 1 from public.conversations c
-       join public.messages m on m.conversation_id = c.id
-       where c.direct_key = key
-     ) then
+  if exists (
+    select 1 from public.profiles
+    where id in (me, other_id) and not allow_messages
+  ) then
     raise exception 'messages_off';
   end if;
 

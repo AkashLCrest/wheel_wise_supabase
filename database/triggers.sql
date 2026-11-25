@@ -7,6 +7,7 @@ CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users FOR EACH ROW EXEC
 -- Keep updated_at current.                           (20261117100945_members_and_settings)
 CREATE TRIGGER profiles_updated_at BEFORE UPDATE ON public.profiles FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER user_settings_updated_at BEFORE UPDATE ON public.user_settings FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER store_subscriptions_updated_at BEFORE UPDATE ON public.store_subscriptions FOR EACH ROW EXECUTE FUNCTION set_updated_at();  -- (20261125100531_membership_store_subscriptions)
 
 -- Order the chat inbox by latest message.            (20261119040231_member_chat)
 CREATE TRIGGER messages_touch_conversation AFTER INSERT ON public.messages FOR EACH ROW EXECUTE FUNCTION touch_conversation();

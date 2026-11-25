@@ -1,7 +1,8 @@
 -- public.set_updated_at()
 --
 -- Trigger function: sets updated_at = now() on every update.
--- Fired by: triggers profiles_updated_at, user_settings_updated_at.
+-- Fired by: triggers profiles_updated_at, user_settings_updated_at,
+-- store_subscriptions_updated_at.
 --
 -- Created in migration: 20261117100945_members_and_settings
 -- Reference copy of the live definition (pg_get_functiondef). Do not apply

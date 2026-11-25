@@ -413,3 +413,11 @@ enabled = true
 # formatted with uppercase keywords, indent 2, max width 180, trailing commas,
 # and column/key alignment. Set to "null" to emit raw, unformatted SQL.
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":180,\"commaStyle\":\"trailing\"}"
+
+# Membership: store webhooks are called by Apple / Google, not by a signed-in
+# member. They check a secret in the URL instead (see the functions).
+[functions.apple-notifications]
+verify_jwt = false
+
+[functions.google-notifications]
+verify_jwt = false

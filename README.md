@@ -50,6 +50,36 @@ it in the Supabase dashboard (Table editor → `feedback`, filter `status = new`
 `status` there. No screenshot attachments yet (would need a storage bucket). Topics and the review
 process are placeholders until the client agrees them.
 
+### Membership (App Store / Google Play)
+
+Membership is one auto-renewing subscription (Annual or Monthly) bought through the App Store or
+Google Play, and it belongs to the member's **WHEEL WISE account** (their email login), not to the
+phone. It follows the member to any device, and someone else who signs in on the same phone does
+not get it.
+
+| Table | Holds |
+|---|---|
+| `store_subscriptions` | One row per store subscription, linked to one account (`user_id`). `platform` (`apple` / `google`), `store_subscription_id` (Apple `originalTransactionId`, which stays the same across renewals; Google purchase token), `product_id`, `plan_id` (`annual` / `monthly`), `status` (`active`, `grace_period`, `billing_retry`, `on_hold`, `paused`, `pending`, `expired`, `revoked` = refunded, `replaced` = Google plan change), `expires_at` (end of the paid or grace period), `auto_renew`, `environment` (`production` / `sandbox`), `store_data` (last store response, for support). A subscription can belong to only one account (unique per platform + store id). Members can **read** their own rows only; only the edge functions (service role) write. |
+| `store_events` | Log of every App Store / Google Play server notification: type, subscription, `outcome` (`saved:<status>`, `no_account`, `not_found`, `ignored_other_app`, `error`, ...), payload. Service role only; for support (Table editor → `store_events`). |
+
+A member has access while one of their subscriptions is `active` or `grace_period` and `expires_at`
+is in the future.
+
+How a purchase becomes a membership:
+
+1. The app starts the store purchase with the member's user id attached (Apple `appAccountToken`,
+   Google `obfuscatedAccountId`).
+2. The app sends the purchase to the `verify-purchase` edge function, which reads it from Apple /
+   Google's server API, checks it is a WHEEL WISE membership for this app, and links it to the
+   account. If the purchase carries a different account's id, or is already linked to another
+   account, the reply is `other_account` and nothing is granted. Google purchases are
+   acknowledged here (Google refunds unacknowledged purchases after 3 days).
+3. Only then does the app finish the store transaction, so a purchase interrupted by a crash or
+   lost connection is sent again on the next launch.
+4. Renewals, cancellations, billing problems, refunds and expiry arrive as store notifications
+   (`apple-notifications`, `google-notifications`), which update the row. The app re-reads
+   `get_my_membership()` on sign-in, on returning to the foreground and when the paid period ends.
+
 ### Functions the app calls (RPC)
 
 All require a signed-in member and act only on that member's own data.
@@ -65,6 +95,7 @@ All require a signed-in member and act only on that member's own data.
 | `remove_conversation(conv)` | "Remove" (delete the chat for me): like `clear_conversation` and also sets `removed_at`, so the chat leaves the inbox until a new message arrives. Nothing is deleted. |
 | `delete_message(msg)` | Deletes one of the member's own messages for both people by setting `deleted_at` (soft delete: text, attachments and files are kept and can be retrieved; restore by clearing `deleted_at`). Refuses another member's message; does nothing if already deleted. |
 | `edit_message(msg, new_body)` | Edits the text (or image/video caption) of one of the member's own messages and sets `edited_at`. No time limit. Text is trimmed; a text message can't be emptied (an empty caption becomes null); max 1000 characters. Refuses another member's message, a deleted message, or while either member has blocked the other or has `allow_messages` off. Unchanged text does nothing. |
+| `get_my_membership()` | The member's membership: `is_member`, `platform`, `product_id`, `plan_id`, `status`, `expires_at`, `auto_renew` from their best subscription (one with access first, then the latest expiry). No row = never subscribed. |
 | `delete_my_account()` | Soft-deletes the member and frees their email: sets `profiles.deleted_at`, saves the email in `profiles.deleted_email`, swaps the auth email for a placeholder (`deleted+<user id>@deleted.invalid`), bans their auth user so they can't sign in again, and ends their sessions. All their data stays (earlier chat messages remain visible to the other member). Deleted members are left out of `list_members()`. Signing up again with the same email creates a brand-new account; old data does not carry over. The team can restore the old account by clearing `profiles.deleted_at` and `auth.users.banned_until` and copying `deleted_email` back, only if no new account has taken that email. |
 
 Block and unblock are plain insert/delete on `blocked_members` (no RPC).
@@ -107,6 +138,7 @@ All schema changes live in `supabase/migrations/` and are applied in filename or
 | `20261124085835_chat_clear_and_remove.sql` | applied (24 Nov 2026), adds `conversation_members.cleared_at` / `removed_at`, `clear_conversation()` and `remove_conversation()` (both for the member only, nothing deleted); the messages read policy hides messages before the member's `cleared_at`; `list_conversations()` respects both |
 | `20261124091900_list_members_has_chat.sql` | applied (24 Nov 2026), `list_members()` also returns `has_chat`, so the app shows "not accepting messages" only when a message would really be refused (including chats removed from the inbox) |
 | `20261124092622_chat_messages_off_both_ways.sql` | applied (24 Nov 2026), `allow_messages` off now stops all messaging both ways in every chat (sends, uploads, edits, opening a chat), like a block; `list_conversations()` returns `member_allow_messages`; removes `has_chat` from `list_members()` again |
+| `20261125100531_membership_store_subscriptions.sql` | applied (25 Nov 2026), membership linked to the member's account: `store_subscriptions` (verified App Store / Google Play subscriptions, members read their own, only the edge functions write), `store_events` (store notification log, service role only) and `get_my_membership()` |
 
 File version numbers match the project's migration history, so `supabase migration list`
 shows local and remote in step.
@@ -121,6 +153,54 @@ supabase db push                  # apply to the remote project
 ```
 
 Never edit a migration that has already been applied. Add a new one instead.
+
+## Edge functions (membership)
+
+Source in `supabase/functions/` (shared code in `_shared/`). Deploy with
+`supabase functions deploy <name>`; `config.toml` turns the platform JWT check off for the two
+webhooks, which are called by Apple / Google rather than a signed-in member.
+
+| Function | Called by | Does |
+|---|---|---|
+| `verify-purchase` | the app, with the member's session (JWT check on) | Checks a purchase with Apple / Google and links it to the member. Body `{ platform: 'apple', transactionId }` or `{ platform: 'google', productId, purchaseToken }`. Replies `{ result }`: `verified`, `other_account`, `not_found` or `wrong_product`. |
+| `apple-notifications` | App Store Server Notifications V2 | Updates the subscription a notification is about. |
+| `google-notifications` | Google Play Real-time developer notifications (Pub/Sub push) | Same for Google; refunds (voided purchases) mark the row `revoked`. |
+
+The webhooks never trust the notification itself: they only use it to find which subscription
+changed, then read its current state from Apple / Google's API. A forged call can't grant or
+change a membership. Their URLs also carry a secret (`?secret=<STORE_WEBHOOK_SECRET>`).
+
+### Secrets (Dashboard → Edge Functions → Secrets, or `supabase secrets set`)
+
+| Secret | Value |
+|---|---|
+| `APPLE_ISSUER_ID` | App Store Connect → Users and Access → Integrations → In-App Purchase: Issuer ID |
+| `APPLE_KEY_ID` | the In-App Purchase key's Key ID (same page; generate a key if there is none) |
+| `APPLE_PRIVATE_KEY` | full contents of the downloaded `SubscriptionKey_<KEY_ID>.p8` |
+| `APPLE_BUNDLE_ID` | the iOS app's bundle id (must match the app in App Store Connect) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | full JSON key of a Google Cloud service account with the Google Play Android Developer API enabled, invited in Play Console → Users and permissions with *View financial data* and *Manage orders and subscriptions* |
+| `GOOGLE_PACKAGE_NAME` | the Android application id (currently `com.wheelui`) |
+| `STORE_WEBHOOK_SECRET` | a long random string (e.g. `openssl rand -hex 32`), also put in both webhook URLs |
+
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided automatically.
+
+### Store setup
+
+- **Products**: create the auto-renewable subscriptions `com.wheelwise.membership.annual` and
+  `com.wheelwise.membership.monthly` in App Store Connect (one subscription group) and Google Play
+  Console (each with one base plan). The ids must match `_shared/products.ts` and the app's
+  `src/constants/membership.ts`.
+- **Apple notifications**: App Store Connect → the app → App Information → App Store Server
+  Notifications → Version 2, production and sandbox URL:
+  `https://xgujbqsqipsuiibsmcvy.supabase.co/functions/v1/apple-notifications?secret=<STORE_WEBHOOK_SECRET>`
+- **Google notifications**: create a Pub/Sub topic, grant
+  `google-play-developer-notifications@system.gserviceaccount.com` *Pub/Sub Publisher* on it, add a
+  **push** subscription to
+  `https://xgujbqsqipsuiibsmcvy.supabase.co/functions/v1/google-notifications?secret=<STORE_WEBHOOK_SECRET>`,
+  then Play Console → Monetization setup → Real-time developer notifications → that topic
+  (use "Send test notification"; it shows in `store_events` as `TEST`).
+- **Testing**: Apple sandbox / TestFlight purchases and Google licence-tester purchases work
+  against the same functions; they are saved with `environment = 'sandbox'`.
 
 ## Functions, triggers and views (reference copies)
 
@@ -138,7 +218,8 @@ and change a function by adding a new migration (then update its file here). `pu
 and the `ensure_rls` event trigger come from Supabase's project setup, not from our migrations.
 
 Refresh check: each file's definition matches `pg_get_functiondef()` / `pg_get_triggerdef()`
-on the live database (last checked 19 Nov 2026; `delete_my_account` re-checked 23 Nov 2026).
+on the live database (last checked 19 Nov 2026; `delete_my_account` re-checked 23 Nov 2026;
+`get_my_membership` and `store_subscriptions_updated_at` added 25 Nov 2026).
 
 ## Claude Code
 

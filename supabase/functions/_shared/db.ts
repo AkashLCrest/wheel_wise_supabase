@@ -28,32 +28,82 @@ function columns(sub: StoreSubscription) {
   };
 }
 
-async function ownerOf(
+type SavedRow = { user_id: string; status: string; expires_at: string | null };
+
+async function findRow(
   platform: Platform,
   storeSubscriptionId: string,
-): Promise<string | null> {
+): Promise<SavedRow | null> {
   const { data, error } = await admin
     .from(TABLE)
-    .select('user_id')
+    .select('user_id, status, expires_at')
     .eq('platform', platform)
     .eq('store_subscription_id', storeSubscriptionId)
     .maybeSingle();
   if (error) {
     throw error;
   }
-  return data?.user_id ?? null;
+  return data;
 }
 
-async function update(sub: StoreSubscription, userId: string): Promise<void> {
-  const { error } = await admin
+function sameUser(a: string | null, b: string): boolean {
+  return Boolean(a) && a!.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * Whether the saved row still holds the subscription for its owner: paid up or
+ * in grace (period not over yet), or the store is still retrying the renewal
+ * payment. A lapsed row (expired, refunded, period over) no longer does.
+ */
+function stillInUse(row: SavedRow): boolean {
+  if (row.status === 'billing_retry') {
+    return true;
+  }
+  return (
+    (row.status === 'active' || row.status === 'grace_period') &&
+    row.expires_at !== null &&
+    Date.parse(row.expires_at) > Date.now()
+  );
+}
+
+/**
+ * Apple keeps the same originalTransactionId when an Apple ID subscribes again
+ * after the subscription ended, even from another WHEEL WISE account. The
+ * subscription may move to that account only when the old owner's row has
+ * lapsed AND the new purchase carries the new account's id (appAccountToken),
+ * i.e. the new account made (and pays for) it.
+ */
+function mayTakeOver(row: SavedRow, sub: StoreSubscription, userId: string): boolean {
+  return !stillInUse(row) && sameUser(sub.accountToken, userId);
+}
+
+/**
+ * Saves the store's current state on the row owned by `owner`, and moves the
+ * row to `newOwner` when given (lapsed subscription taken over). Returns false
+ * when the row no longer belongs to `owner` (changed by a parallel request).
+ */
+async function update(
+  sub: StoreSubscription,
+  owner: string,
+  newOwner?: string,
+): Promise<boolean> {
+  const { data, error } = await admin
     .from(TABLE)
-    .update(columns(sub))
+    .update(newOwner ? { ...columns(sub), user_id: newOwner } : columns(sub))
     .eq('platform', sub.platform)
     .eq('store_subscription_id', sub.storeSubscriptionId)
-    .eq('user_id', userId);
+    .eq('user_id', owner)
+    .select('id');
   if (error) {
     throw error;
   }
+  const saved = (data ?? []).length > 0;
+  if (newOwner && saved) {
+    console.log(
+      `${sub.platform} subscription ${sub.storeSubscriptionId} moved from lapsed account ${owner} to ${newOwner}`,
+    );
+  }
+  return saved;
 }
 
 /** Inserts; returns false if another request saved the same subscription first. */
@@ -70,11 +120,13 @@ async function insert(sub: StoreSubscription, userId: string): Promise<boolean> 
   return true;
 }
 
-/** Google plan change / resubscribe: the older purchase token is replaced. */
-async function retireLinkedToken(
-  sub: StoreSubscription,
-  userId: string,
-): Promise<void> {
+/**
+ * Google plan change / resubscribe: the older purchase token is replaced. Google
+ * itself says the old token is no longer valid, so its row is retired whoever
+ * owns it (it may be another account on the same Google account whose
+ * subscription lapsed).
+ */
+async function retireLinkedToken(sub: StoreSubscription): Promise<void> {
   if (sub.platform !== 'google' || !sub.linkedPurchaseToken) {
     return;
   }
@@ -82,8 +134,7 @@ async function retireLinkedToken(
     .from(TABLE)
     .update({ status: 'replaced' })
     .eq('platform', 'google')
-    .eq('store_subscription_id', sub.linkedPurchaseToken)
-    .eq('user_id', userId);
+    .eq('store_subscription_id', sub.linkedPurchaseToken);
   if (error) {
     throw error;
   }
@@ -107,34 +158,44 @@ async function acknowledgeIfNeeded(sub: StoreSubscription): Promise<void> {
 
 export type LinkResult = 'verified' | 'other_account';
 
+async function afterSave(sub: StoreSubscription): Promise<void> {
+  await retireLinkedToken(sub);
+  await acknowledgeIfNeeded(sub);
+}
+
 /**
  * Links a verified subscription to the signed-in member and saves it.
  *
  * A subscription belongs to one WHEEL WISE account: the account the app
  * attached to the purchase, or (purchases with no account attached, e.g. an
  * App Store offer code) the first account to verify it. Anyone else gets
- * 'other_account' and no access.
+ * 'other_account' and no access, except when the other account's
+ * subscription has lapsed and this member bought it again (mayTakeOver).
  */
 export async function linkToUser(
   sub: StoreSubscription,
   userId: string,
 ): Promise<LinkResult> {
-  if (sub.accountToken && sub.accountToken.toLowerCase() !== userId.toLowerCase()) {
+  if (sub.accountToken && !sameUser(sub.accountToken, userId)) {
     return 'other_account';
   }
   for (let attempt = 0; attempt < 2; attempt++) {
-    const owner = await ownerOf(sub.platform, sub.storeSubscriptionId);
-    if (owner && owner !== userId) {
+    const row = await findRow(sub.platform, sub.storeSubscriptionId);
+    let saved: boolean;
+    if (!row) {
+      saved = await insert(sub, userId);
+    } else if (row.user_id === userId) {
+      saved = await update(sub, userId);
+    } else if (mayTakeOver(row, sub, userId)) {
+      saved = await update(sub, row.user_id, userId);
+    } else {
       return 'other_account';
     }
-    if (owner) {
-      await update(sub, userId);
-    } else if (!(await insert(sub, userId))) {
-      continue; // saved by a parallel request: check the owner again
+    if (saved) {
+      await afterSave(sub);
+      return 'verified';
     }
-    await retireLinkedToken(sub, userId);
-    await acknowledgeIfNeeded(sub);
-    return 'verified';
+    // Changed by a parallel request: check the owner again.
   }
   return 'other_account';
 }
@@ -144,26 +205,54 @@ async function userExists(userId: string): Promise<boolean> {
   return !error && Boolean(data?.user);
 }
 
+/** The account the purchase names (appAccountToken / obfuscatedAccountId), if it exists. */
+async function tokenUser(sub: StoreSubscription): Promise<string | null> {
+  return isUuid(sub.accountToken) && (await userExists(sub.accountToken))
+    ? sub.accountToken.toLowerCase()
+    : null;
+}
+
 /**
- * Store notification: updates the saved subscription. A subscription the app
- * never got to verify (e.g. the app closed mid-purchase) is saved for the
- * account attached to the purchase, if that account exists.
- * Returns the owning user id, or null when it can't be linked to anyone.
+ * Store notification: updates the saved subscription. Returns the owning user
+ * id, or null when it can't be linked to anyone.
+ *
+ * - Saved already: updated for its owner, or moved to the account named in
+ *   the purchase when the owner's subscription lapsed and that account bought
+ *   it again (Apple resubscribe from another WHEEL WISE account).
+ * - Not saved yet (e.g. the app closed mid-purchase): saved for the account
+ *   named in the purchase, or (Google resubscribe / plan change made in the
+ *   Play Store, which names no account) for the owner of the purchase it
+ *   replaces.
  */
 export async function saveFromNotification(
   sub: StoreSubscription,
 ): Promise<string | null> {
-  const owner = await ownerOf(sub.platform, sub.storeSubscriptionId);
-  if (owner) {
-    await update(sub, owner);
-    await retireLinkedToken(sub, owner);
-    await acknowledgeIfNeeded(sub);
-    return owner;
+  let row = await findRow(sub.platform, sub.storeSubscriptionId);
+  for (let attempt = 0; row && attempt < 2; attempt++) {
+    const named = sameUser(sub.accountToken, row.user_id) ? null : await tokenUser(sub);
+    const owner = named && mayTakeOver(row, sub, named) ? named : row.user_id;
+    if (await update(sub, row.user_id, owner === row.user_id ? undefined : owner)) {
+      await afterSave(sub);
+      return owner;
+    }
+    row = await findRow(sub.platform, sub.storeSubscriptionId);
   }
-  if (isUuid(sub.accountToken) && (await userExists(sub.accountToken))) {
-    return (await linkToUser(sub, sub.accountToken)) === 'verified'
-      ? sub.accountToken
-      : null;
+  if (row) {
+    // Changed by parallel requests both times: fail so the store retries.
+    throw new Error('Subscription changed while saving');
+  }
+
+  const named = await tokenUser(sub);
+  if (named) {
+    return (await linkToUser(sub, named)) === 'verified' ? named : null;
+  }
+  if (sub.platform === 'google' && sub.linkedPurchaseToken) {
+    const replaced = await findRow('google', sub.linkedPurchaseToken);
+    if (replaced) {
+      return (await linkToUser(sub, replaced.user_id)) === 'verified'
+        ? replaced.user_id
+        : null;
+    }
   }
   return null;
 }

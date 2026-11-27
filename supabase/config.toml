@@ -421,3 +421,7 @@ verify_jwt = false
 
 [functions.google-notifications]
 verify_jwt = false
+
+# B22: the booklet QR address. Anyone who scans the booklet opens it.
+[functions.qr]
+verify_jwt = false

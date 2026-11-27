@@ -74,11 +74,35 @@ How a purchase becomes a membership:
    account. If the purchase carries a different account's id, or is already linked to another
    account, the reply is `other_account` and nothing is granted. Google purchases are
    acknowledged here (Google refunds unacknowledged purchases after 3 days).
+   - **Buying again after expiry from another account:** Apple keeps the same
+     `originalTransactionId` when an Apple ID subscribes again, even from a different WHEEL WISE
+     account. The row moves to the new account only when the old owner's subscription has lapsed
+     (expired, refunded, or paid period over; not while still active, in grace or in billing
+     retry) **and** the new purchase carries the new account's id. The old account then has no
+     row. The notification for that purchase follows the same rule, so whichever arrives
+     first gives the same result.
 3. Only then does the app finish the store transaction, so a purchase interrupted by a crash or
    lost connection is sent again on the next launch.
-4. Renewals, cancellations, billing problems, refunds and expiry arrive as store notifications
-   (`apple-notifications`, `google-notifications`), which update the row. The app re-reads
+4. Renewals, cancellations (auto-renew off: access continues until `expires_at`), billing
+   problems, refunds, expiry and buying again arrive as store notifications
+   (`apple-notifications`, `google-notifications`), which update the row. A Google resubscribe
+   made in the Play Store gets a new purchase token with no account id; it is saved for the
+   owner of the purchase it replaces (`linkedPurchaseToken`), and the old row becomes `replaced`. The app re-reads
    `get_my_membership()` on sign-in, on returning to the foreground and when the paid period ends.
+
+### Booklet QR codes (B22, groundwork)
+
+| Table | Holds |
+|---|---|
+| `qr_links` | One row per QR code printed in the booklet: `code` (short code in the QR address, lowercase letters/digits/`-`/`_`), `target` (an app screen name such as `Wheel`, `BrainDeFogger`, `MembershipPlans`; one Brain De Fogger™ lesson as `BrainDeFogger/<lesson number>`, e.g. `BrainDeFogger/3` for lesson 3; or a web address starting with `https://`), `note` (team notes), `updated_at`. Anyone can read it (the codes are printed); only the team changes it in the dashboard. |
+
+A printed QR encodes `https://xgujbqsqipsuiibsmcvy.supabase.co/functions/v1/qr?c=<code>` (to be
+replaced by an address on the client's own domain before anything is printed). The `qr` edge
+function redirects to the row's web address, or to `wheelwise://qr/<code>`, which opens the app
+on that screen (after sign-in, and after membership for member screens). To repoint a printed
+code, edit its `target`: no app release and no reprint. Seeded with one placeholder,
+`booklet` → `BrainDeFogger`, plus `lesson1`…`lesson8` → `BrainDeFogger/1`…`/8` (one per
+Brain De Fogger™ lesson, address `…/functions/v1/qr?c=lesson3`); the real destinations are still to be agreed with the client.
 
 ### Functions the app calls (RPC)
 
@@ -139,6 +163,8 @@ All schema changes live in `supabase/migrations/` and are applied in filename or
 | `20261124091900_list_members_has_chat.sql` | applied (24 Nov 2026), `list_members()` also returns `has_chat`, so the app shows "not accepting messages" only when a message would really be refused (including chats removed from the inbox) |
 | `20261124092622_chat_messages_off_both_ways.sql` | applied (24 Nov 2026), `allow_messages` off now stops all messaging both ways in every chat (sends, uploads, edits, opening a chat), like a block; `list_conversations()` returns `member_allow_messages`; removes `has_chat` from `list_members()` again |
 | `20261125100531_membership_store_subscriptions.sql` | applied (25 Nov 2026), membership linked to the member's account: `store_subscriptions` (verified App Store / Google Play subscriptions, members read their own, only the edge functions write), `store_events` (store notification log, service role only) and `get_my_membership()` |
+| `20261126075858_qr_links.sql` | applied (26 Nov 2026), booklet QR groundwork: `qr_links` (where each printed QR code goes, public read, team edits in the dashboard), seeded with the placeholder `booklet` → `BrainDeFogger` |
+| `20261126113257_qr_links_lessons.sql` | applied (26 Nov 2026), adds booklet QR codes `lesson1`…`lesson8` → `BrainDeFogger/1`…`/8` (each opens one Brain De Fogger™ lesson) |
 
 File version numbers match the project's migration history, so `supabase migration list`
 shows local and remote in step.
@@ -165,6 +191,7 @@ webhooks, which are called by Apple / Google rather than a signed-in member.
 | `verify-purchase` | the app, with the member's session (JWT check on) | Checks a purchase with Apple / Google and links it to the member. Body `{ platform: 'apple', transactionId }` or `{ platform: 'google', productId, purchaseToken }`. Replies `{ result }`: `verified`, `other_account`, `not_found` or `wrong_product`. |
 | `apple-notifications` | App Store Server Notifications V2 | Updates the subscription a notification is about. |
 | `google-notifications` | Google Play Real-time developer notifications (Pub/Sub push) | Same for Google; refunds (voided purchases) mark the row `revoked`. |
+| `qr` | anyone scanning a booklet QR (JWT check off) | `GET ?c=<code>`: redirects to the code's `qr_links.target` (a web address, or `wheelwise://qr/<code>` for an app screen). Unknown code: "not active yet" page. |
 
 The webhooks never trust the notification itself: they only use it to find which subscription
 changed, then read its current state from Apple / Google's API. A forged call can't grant or
@@ -177,9 +204,9 @@ change a membership. Their URLs also carry a secret (`?secret=<STORE_WEBHOOK_SEC
 | `APPLE_ISSUER_ID` | App Store Connect → Users and Access → Integrations → In-App Purchase: Issuer ID |
 | `APPLE_KEY_ID` | the In-App Purchase key's Key ID (same page; generate a key if there is none) |
 | `APPLE_PRIVATE_KEY` | full contents of the downloaded `SubscriptionKey_<KEY_ID>.p8` |
-| `APPLE_BUNDLE_ID` | the iOS app's bundle id (must match the app in App Store Connect) |
+| `APPLE_BUNDLE_ID` | the iOS app's bundle id, `com.wheelwise.app` (must match the app in App Store Connect) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | full JSON key of a Google Cloud service account with the Google Play Android Developer API enabled, invited in Play Console → Users and permissions with *View financial data* and *Manage orders and subscriptions* |
-| `GOOGLE_PACKAGE_NAME` | the Android application id (currently `com.wheelui`) |
+| `GOOGLE_PACKAGE_NAME` | the Android application id (`com.wheelwise.app`) |
 | `STORE_WEBHOOK_SECRET` | a long random string (e.g. `openssl rand -hex 32`), also put in both webhook URLs |
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided automatically.
